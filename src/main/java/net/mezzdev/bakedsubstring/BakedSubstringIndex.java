@@ -10,9 +10,14 @@ import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.function.Consumer;
 
 import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.longs.Long2IntMap;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
@@ -76,7 +81,22 @@ public final class BakedSubstringIndex<T> {
 	 * @return a new builder
 	 */
 	public static <T> Builder<T> builder() {
-		return new Builder<>();
+		return new Builder<>(null);
+	}
+
+	/**
+	 * Creates a builder that can index batches of keys while the caller adds more entries.
+	 * Only immutable key strings are passed to the executor; values remain on the calling thread.
+	 * The caller owns the executor and must keep it available until building is complete.
+	 * Rejected work is performed on the calling thread. Builders still require external synchronization.
+	 *
+	 * @param executor the executor used for indexing key batches
+	 * @param <T> the value type stored in the index
+	 * @return a new builder
+	 * @throws NullPointerException if {@code executor} is null
+	 */
+	public static <T> Builder<T> builder(Executor executor) {
+		return new Builder<>(Objects.requireNonNull(executor, "executor"));
 	}
 
 	/**
@@ -285,9 +305,14 @@ public final class BakedSubstringIndex<T> {
 	 */
 	public static final class Builder<T> {
 		private final List<String> keys = new ArrayList<>();
+		private static final int BATCH_SIZE = 1024;
 		private final List<T> values = new ArrayList<>();
+		private final @Nullable Executor executor;
+		private final List<FutureTask<Long2ObjectOpenHashMap<IntArrayList>>> batches = new ArrayList<>();
+		private int submittedKeys;
 
-		private Builder() {
+		private Builder(@Nullable Executor executor) {
+			this.executor = executor;
 		}
 
 		/**
@@ -305,6 +330,9 @@ public final class BakedSubstringIndex<T> {
 			Objects.requireNonNull(value, "value");
 			keys.add(key);
 			values.add(value);
+			if (executor != null && keys.size() - submittedKeys >= BATCH_SIZE) {
+				submitBatch(executor);
+			}
 			return this;
 		}
 
@@ -316,25 +344,100 @@ public final class BakedSubstringIndex<T> {
 		public BakedSubstringIndex<T> build() {
 			String[] keyArray = keys.toArray(String[]::new);
 			Object[] valueArray = values.toArray();
-			Long2ObjectOpenHashMap<IntArrayList> mutableEntriesByGram = new Long2ObjectOpenHashMap<>();
-			Long2IntOpenHashMap lastEntryByGram = new Long2IntOpenHashMap();
-			lastEntryByGram.defaultReturnValue(-1);
+			Long2ObjectOpenHashMap<int[]> entriesByGram;
+			if (executor == null) {
+				entriesByGram = freezeGrams(List.of(buildGrams(keyArray, 0)));
+			} else {
+				if (submittedKeys < keys.size()) {
+					submitBatch(executor);
+				}
+				List<Long2ObjectOpenHashMap<IntArrayList>> completed = new ArrayList<>(batches.size());
+				boolean interrupted = false;
+				try {
+					for (FutureTask<Long2ObjectOpenHashMap<IntArrayList>> batch : batches) {
+						// Help queued work, including when build is called on the same single-thread executor.
+						batch.run();
+						while (true) {
+							try {
+								completed.add(batch.get());
+								break;
+							} catch (InterruptedException e) {
+								interrupted = true;
+							} catch (ExecutionException e) {
+								throw new IllegalStateException("Failed to index key batch", e.getCause());
+							}
+						}
+					}
+				} finally {
+					if (interrupted) {
+						Thread.currentThread().interrupt();
+					}
+				}
+				entriesByGram = freezeGrams(completed);
+			}
 			Set<T> seenValues = Collections.newSetFromMap(new IdentityHashMap<>());
 			boolean deduplicateResults = false;
-
-			for (int entryIndex = 0; entryIndex < keyArray.length; entryIndex++) {
-				String key = keyArray[entryIndex];
-				addGrams(mutableEntriesByGram, lastEntryByGram, key, entryIndex);
-				if (!seenValues.add(values.get(entryIndex))) {
+			for (T value : values) {
+				if (!seenValues.add(value)) {
 					deduplicateResults = true;
 				}
 			}
-
-			Long2ObjectOpenHashMap<int[]> entriesByGram = new Long2ObjectOpenHashMap<>(mutableEntriesByGram.size());
-			for (Long2ObjectMap.Entry<IntArrayList> entry : mutableEntriesByGram.long2ObjectEntrySet()) {
-				entriesByGram.put(entry.getLongKey(), entry.getValue().toIntArray());
-			}
 			return new BakedSubstringIndex<>(keyArray, valueArray, entriesByGram, deduplicateResults);
+		}
+
+		private void submitBatch(Executor executor) {
+			int firstEntry = submittedKeys;
+			String[] batchKeys = keys.subList(firstEntry, keys.size()).toArray(String[]::new);
+			FutureTask<Long2ObjectOpenHashMap<IntArrayList>> batch =
+					new FutureTask<>(() -> buildGrams(batchKeys, firstEntry));
+			batches.add(batch);
+			submittedKeys = keys.size();
+			try {
+				executor.execute(batch);
+			} catch (RejectedExecutionException e) {
+				batch.run();
+			}
+		}
+
+		private static Long2ObjectOpenHashMap<IntArrayList> buildGrams(String[] keys, int firstEntry) {
+			Long2ObjectOpenHashMap<IntArrayList> entries = new Long2ObjectOpenHashMap<>();
+			Long2IntOpenHashMap lastEntry = new Long2IntOpenHashMap();
+			lastEntry.defaultReturnValue(-1);
+			for (int i = 0; i < keys.length; i++) {
+				addGrams(entries, lastEntry, keys[i], firstEntry + i);
+			}
+			return entries;
+		}
+
+		private static Long2ObjectOpenHashMap<int[]> freezeGrams(List<Long2ObjectOpenHashMap<IntArrayList>> batches) {
+			if (batches.size() == 1) {
+				Long2ObjectOpenHashMap<IntArrayList> batch = batches.get(0);
+				Long2ObjectOpenHashMap<int[]> entries = new Long2ObjectOpenHashMap<>(batch.size());
+				for (Long2ObjectMap.Entry<IntArrayList> entry : batch.long2ObjectEntrySet()) {
+					entries.put(entry.getLongKey(), entry.getValue().toIntArray());
+				}
+				return entries;
+			}
+			Long2IntOpenHashMap lengths = new Long2IntOpenHashMap();
+			for (Long2ObjectOpenHashMap<IntArrayList> batch : batches) {
+				for (Long2ObjectMap.Entry<IntArrayList> entry : batch.long2ObjectEntrySet()) {
+					lengths.addTo(entry.getLongKey(), entry.getValue().size());
+				}
+			}
+			Long2ObjectOpenHashMap<int[]> entries = new Long2ObjectOpenHashMap<>(lengths.size());
+			for (Long2IntMap.Entry entry : lengths.long2IntEntrySet()) {
+				entries.put(entry.getLongKey(), new int[entry.getIntValue()]);
+			}
+			lengths.clear();
+			for (Long2ObjectOpenHashMap<IntArrayList> batch : batches) {
+				for (Long2ObjectMap.Entry<IntArrayList> entry : batch.long2ObjectEntrySet()) {
+					long gram = entry.getLongKey();
+					IntArrayList list = entry.getValue();
+					int offset = lengths.addTo(gram, list.size());
+					list.getElements(0, entries.get(gram), offset, list.size());
+				}
+			}
+			return entries;
 		}
 
 		private static void addGrams(

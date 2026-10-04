@@ -8,6 +8,10 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.Test;
 
@@ -237,6 +241,110 @@ public class BakedSubstringIndexTest {
 
 		assertTrue(index.getSearchResults("a").isEmpty());
 		assertEquals(List.of(value), new ArrayList<>(index.getAllElements()));
+	}
+
+	@Test
+	public void executorBuilderPreservesEntryOrderAcrossBatchesAndBuilds() {
+		List<Runnable> queued = new ArrayList<>();
+		BakedSubstringIndex.Builder<Object> builder = BakedSubstringIndex.builder(queued::add);
+		List<Object> values = new ArrayList<>();
+		for (int i = 0; i < 2050; i++) {
+			Object value = new Object();
+			values.add(value);
+			builder.put("shared-key-" + i, value);
+		}
+		assertEquals(2, queued.size()); // Full batches start before build.
+		Collections.reverse(queued);
+		queued.forEach(Runnable::run);
+		BakedSubstringIndex<Object> first = builder.build();
+		assertEquals(values, new ArrayList<>(first.getSearchResults("shared")));
+		assertEquals(values, new ArrayList<>(builder.build().getSearchResults("shared")));
+
+		Object extra = new Object();
+		builder.put("shared-extra", extra);
+		BakedSubstringIndex<Object> second = builder.build();
+		values.add(extra);
+		assertEquals(values, new ArrayList<>(second.getSearchResults("shared")));
+		assertEquals(2050, first.getSearchResults("shared").size());
+	}
+
+	@Test
+	public void parallelBatchesMatchSynchronousUnicodeAndIdentityResults() throws Exception {
+		ExecutorService executor = Executors.newFixedThreadPool(3);
+		try {
+			BakedSubstringIndex.Builder<Object> synchronous = BakedSubstringIndex.builder();
+			BakedSubstringIndex.Builder<Object> parallel = BakedSubstringIndex.builder(executor);
+			Object repeated = new EqualValue("same");
+			for (int i = 0; i < 4097; i++) {
+				String key = switch (i % 5) {
+					case 0 -> "banana-" + i;
+					case 1 -> "\u03bb-caf\u00e9-" + i;
+					case 2 -> "\ud83d\ude00-\ud800-" + i;
+					case 3 -> "";
+					default -> "abcxxbcde";
+				};
+				Object value = i % 7 == 0 ? repeated : new EqualValue("same");
+				synchronous.put(key, value);
+				parallel.put(key, value);
+			}
+			BakedSubstringIndex<Object> expected = synchronous.build();
+			BakedSubstringIndex<Object> actual = parallel.build();
+			for (String query : List.of("", "a", "ana", "banana", "\u03bb", "caf\u00e9", "\ude00", "\ud800", "abcde", "4096", "missing")) {
+				Set<Object> wanted = search(expected, query);
+				Set<Object> found = search(actual, query);
+				assertEquals(wanted.size(), found.size());
+				for (Object value : wanted) {
+					assertTrue(containsIdentity(found, value));
+				}
+			}
+		} finally {
+			executor.shutdownNow();
+			assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+		}
+	}
+
+	@Test
+	public void rejectedBatchesFallBackToCaller() {
+		BakedSubstringIndex.Builder<Integer> builder = BakedSubstringIndex.builder(task -> {
+			throw new RejectedExecutionException("closed");
+		});
+		for (int i = 0; i < 2050; i++) {
+			builder.put("entry-" + i, i);
+		}
+		assertEquals(2050, builder.build().getSearchResults("entry-").size());
+		assertEquals(Set.of(2049), search(builder.build(), "entry-2049"));
+	}
+
+	@Test
+	public void buildHelpsTasksQueuedOnItsOwnExecutor() throws Exception {
+		ExecutorService executor = Executors.newSingleThreadExecutor();
+		try {
+			int count = executor.submit(() -> {
+				BakedSubstringIndex.Builder<Integer> builder = BakedSubstringIndex.builder(executor);
+				for (int i = 0; i < 2050; i++) {
+					builder.put("entry-" + i, i);
+				}
+				return builder.build().getSearchResults("entry-").size();
+			}).get(10, TimeUnit.SECONDS);
+			assertEquals(2050, count);
+		} finally {
+			executor.shutdownNow();
+			assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+		}
+	}
+
+	@Test
+	public void executorBuilderHandlesEmptyContentsAndPreservesInterruptStatus() {
+		assertTrue(BakedSubstringIndex.builder(Runnable::run).build().getAllElements().isEmpty());
+		Thread.currentThread().interrupt();
+		try {
+			BakedSubstringIndex<Integer> index = BakedSubstringIndex.<Integer>builder(Runnable::run)
+					.put("alpha", 1).build();
+			assertEquals(Set.of(1), search(index, "alpha"));
+			assertTrue(Thread.currentThread().isInterrupted());
+		} finally {
+			Thread.interrupted();
+		}
 	}
 
 	private static <T> Set<T> search(BakedSubstringIndex<T> index, String token) {

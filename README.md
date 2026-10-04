@@ -333,6 +333,17 @@ fragments, and verify the remaining keys with `String.contains`. Query preparati
 implementation because duplicate checking and posting-list ordering scan the fragments already collected. Filtering and
 verification can approach `mN` in the worst case, but they are usually smaller when the query fragments are selective.
 
+## Overlapping Collection And Indexing
+
+For large inputs, `BakedSubstringIndex.builder(executor)` starts indexing each completed batch of 1,024 keys while the
+caller collects the next entries. The caller supplies and owns the executor. Only immutable strings are sent to its
+tasks; indexed values are never inspected on those threads. The ordinary `builder()` remains synchronous.
+
+`build()` finishes outstanding work and freezes the posting lists in insertion order. It can help queued tasks itself,
+including when called from the same single-thread executor. Rejected tasks run on the calling thread. Repeated builds
+and additions after a build are supported; previously built indexes remain immutable. As with synchronous building,
+`build()` waits for indexing to finish and preserves the caller's interrupt status.
+
 ## Thread Safety
 
 Built indexes are immutable and safe to share between threads. Builders are mutable and should not be shared without

@@ -5,7 +5,10 @@ Javadocs; the details here are meant to explain the current implementation.
 
 ## Build Flow
 
-`Builder.put(key, value)` only records the key and value. The expensive indexing work happens in `build()`.
+The default `Builder.put(key, value)` only records the key and value. Its expensive indexing work happens in `build()`.
+The executor overload additionally submits immutable key snapshots in batches. Each batch owns its mutable postings,
+using the original global entry ids. `build()` collects completed batches in insertion order, counts posting lengths,
+and copies them into final arrays. No mutable posting list is shared between worker tasks or with a built index.
 
 During `build()`, each key/value pair gets an entry id from its position in the builder lists. The builder then extracts
 all one-, two-, and three-character fragments from each key. Repeated fragments within the same key are ignored, so one
